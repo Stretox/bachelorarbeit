@@ -377,18 +377,11 @@ class MovementAttn(nn.Module):
             # Just standard stuff basically
 
         # flow consistency (encourages predicted prev position to be along real flow dir)
-        if flow_dir is not None:
-            # vector from current to predicted prev pos
-            vec = F.normalize(prev_pos_pred - pts_world, dim=-1)
-            flow_u = F.normalize(flow_dir, dim=-1)
-            # print(vec.shape, flow_u.shape)
-            # cosine similarity (want them to align negatively because flow is movement from prev->cur; if flow indicates cur direction, prev is opposite)
-            cos = (flow_u * vec).sum(dim=-1)  # [N]
-            # if aligned cos will be closer to 1.0
-            # encourage cos to be close to -1 if flow points current->next, but since flow semantics are without any reason (Due to bad flow definition in training data), allow positive reward for alignment
-            # here we encourage dot(flow, (prev - cur)) > 0 then prev is in direction opposite to flow #TODO: Flip sign????
-            flow_consistency = torch.mean(1.0 - cos)  # smaller when aligned
-            losses['flow_consistency'] = flow_consistency
+        vec = F.normalize(motion_res, dim=-1)  # Direction from current to predicted previous position
+        flow_u = F.normalize(real_flow_dir, dim=-1)          # Normalized ground truth flow direction
+        cos = (flow_u * vec).sum(dim=-1)                     # Cosine similarity between `vec` and `flow_u`
+        flow_consistency = torch.mean(1.0 - cos)             # Loss: 1 + cos
+        losses['flow_consistency'] = flow_consistency
 
         out['losses'] = losses
         return out

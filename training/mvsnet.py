@@ -8,6 +8,8 @@ import time
 from datetime import datetime
 from torch.utils.data import DataLoader
 import torch.optim as optim
+torch.set_float32_matmul_precision('high')
+from torch import GradScaler
 
 from termcolor import colored
 
@@ -20,18 +22,19 @@ def train_mvsnet(hair_folder:str,
                 camera_folder:str,
                 checkpoint_save_path:str,  
                 multi:bool=False,
-                load_checkpoint: bool = True,
-                checkpoint_path: str ="/home/user/mvshair/data/checkpoints11/checkpoint_epoch_4.pt",
+                load_checkpoint: bool = False,
+                small:bool = True,
+                checkpoint_path: str ="/home/student_korfhage/mvshair/data/checkpoints11/checkpoint_epoch_4.pt",
                  ):
     
     log_dir = os.path.join(checkpoint_save_path, "logs")
     os.makedirs(log_dir, exist_ok=True)
 
-    # date and time
+    # Get current date and time
     now = datetime.now()
     timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
 
-    # Define a log file path with timestamp
+    # Define the log file path with timestamp
     log_file = os.path.join(log_dir, f"training_losses_{timestamp}.log")
     csv_file = os.path.join(log_dir, f"training_losses_{timestamp}.csv")
 
@@ -50,43 +53,53 @@ def train_mvsnet(hair_folder:str,
     gc.collect()
     torch.cuda.empty_cache()
 
-    # Split dataset into train/val
-    val_split = 0.96
-    num_val = int(len(dataset) * val_split)
-    num_train = len(dataset) - num_val
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [num_train, num_val])
+    if small:
+        small_split = 0.9
+        num_val = int(len(dataset) * small_split)
+        num_train = len(dataset) - num_val
+        train_dataset, _ = torch.utils.data.random_split(dataset, [num_train, num_val])
+        print(f"Train samples: {len(train_dataset)}")
+    else:
+        # Split dataset into train/val
+        val_split = 0.1
+        num_val = int(len(dataset) * val_split)
+        num_train = len(dataset) - num_val
+        train_dataset, val_dataset = torch.utils.data.random_split(dataset, [num_train, num_val])
 
-    print(f"Train samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
+        print(f"Train samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False,
-    )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=1,
+            pin_memory=False,
+        )
 
     if multi:
-        dataloader = DataLoader(
-            train_dataset,
-            batch_size=1,
-            shuffle=False, #TODO: should be true
-            num_workers=4,
-            pin_memory=False,
-            prefetch_factor=1,
-        )
-    else:
         dataloader = DataLoader(
             train_dataset,
             batch_size=1,
             shuffle=True, #TODO: should be true
             num_workers=0,
             pin_memory=False,
+            # prefetch_factor=1,
+            # collate_fn=DeviceCollate(device)
+        )
+    else:
+        dataloader = DataLoader(
+            train_dataset,
+            batch_size=1,
+            shuffle=True, #TODO: should be true
+            num_workers=1,
+            pin_memory=False,
+            # collate_fn=DeviceCollate(device)
         )
 
     # model & optimizer stuff
-    model = MovementAttn(in_feat=1, token_dim=64, vit_heads=4, num_views=V, dir_lambda=0.1).to(device)
-    optimizer = optim.Adam(list(model.parameters()), lr=1e-3)
+    model = MovementAttn(in_feat=1, token_dim=64, vit_heads=4, num_views=V, dir_lambda=0.7).to(device)
+    model = torch.compile(model) 
+    optimizer = optim.Adam(list(model.parameters()), lr=1e-2)
 
     start_epoch = 0
     if load_checkpoint and checkpoint_path is not "" and os.path.exists(checkpoint_path):
@@ -101,38 +114,40 @@ def train_mvsnet(hair_folder:str,
         writer = csv.writer(f)
         writer.writerow(["Epoch", "Batch", "Loss_Total", "CE" ,"conn_l1_attn", "conn_l1_res", "flow_consistency"])
 
-    num_epochs = 100
-    sub_batch_epochs = 10
+    num_epochs = 1000
+    sub_batch_epochs = 100
     for epoch in range(start_epoch, num_epochs):
         model.train()
 
         print(colored( f"New EPOCH:  {epoch}", "green"))
+
+        scaler = GradScaler('cuda')
 
         for batch_idx, batch in enumerate(dataloader):
             print(colored( f"New Batch with Index (batch):  {batch_idx}", "magenta"))
 
             # print(f'Sanity Check | batch indexes: {batch.get_strand_idx_from_idx[batch_idx]} | prev_batch indexes: {dataset[batch_idx-1].get_strand_idx_from_idx[batch_idx]}') #TODO:
 
+            with torch.no_grad():
+                imgs_raw = batch['flow_map'].squeeze(0).squeeze(0).to(device)
+                print(f'IMGS Shape: {imgs_raw.shape}')
 
-            imgs_raw = batch['flow_map'].squeeze(0).squeeze(0).to(device)
-            print(f'IMGS Shape: {imgs_raw.shape}')
+                scale = 1.0   
+                new_h, new_w = int(imgs_raw.shape[-2] * scale), int(imgs_raw.shape[-1] * scale)
+                imgs = F.interpolate(imgs_raw, size=(new_h, new_w), mode='bilinear', align_corners=False)
 
-            scale = 0.25    
-            new_h, new_w = int(imgs_raw.shape[-2] * scale), int(imgs_raw.shape[-1] * scale)
-            imgs = F.interpolate(imgs_raw, size=(new_h, new_w), mode='bilinear', align_corners=False)
+                del imgs_raw
 
-            del imgs_raw
+                prev_imgs_raw = batch['prev_flow_map'].squeeze(0).squeeze(0).to(device)
+                print(f'IMGS Shape: {prev_imgs_raw.shape}')
 
-            prev_imgs_raw = batch['prev_flow_map'].squeeze(0).squeeze(0).to(device)
-            print(f'IMGS Shape: {prev_imgs_raw.shape}')
+                scale = 0.25    
+                new_h, new_w = int(prev_imgs_raw.shape[-2] * scale), int(prev_imgs_raw.shape[-1] * scale)
+                imgs = F.interpolate(prev_imgs_raw, size=(new_h, new_w), mode='bilinear', align_corners=False)
 
-            scale = 0.25    
-            new_h, new_w = int(prev_imgs_raw.shape[-2] * scale), int(prev_imgs_raw.shape[-1] * scale)
-            imgs = F.interpolate(prev_imgs_raw, size=(new_h, new_w), mode='bilinear', align_corners=False)
+                del prev_imgs_raw
 
-            del prev_imgs_raw
-
-            print(f'Flow Map Shape: {imgs.shape} (Subsamples IMGS)')
+                print(f'Flow Map Shape: {imgs.shape} (Subsamples IMGS)')
 
             for i, chunk in enumerate(canonicalize_and_subsample_iter(batch, device, num_points=100, num_prev_points=100000)):
                 print("chunk", i, {k: (None if v is None else tuple(v.shape)) for k, v in chunk.items()})
@@ -141,6 +156,9 @@ def train_mvsnet(hair_folder:str,
 
 
             start_time = time.time()
+
+            batch_log = []  # collect logs for this batch
+            batch_losses = []
 
             for sub_batch_idx, sub_batch in enumerate(canonicalize_and_subsample_iter(batch, device, num_points=100, num_prev_points=100000)):
 
@@ -162,42 +180,23 @@ def train_mvsnet(hair_folder:str,
 
                 del clean
 
-                gc.collect()
-                torch.cuda.empty_cache()
+                with torch.autocast("cuda"):
+                    out = model(data)
 
-                out = model(data)
+                    loss = out['losses']
+                    total_loss = sum(loss.values())
 
-                loss = out['losses']
+                     # Backward pass
+                    #ignore this. It works 
+                    scaler.scale(total_loss).backward() #TODO: Really tho?
 
-                # print("Alpha: ", out['alpha'][:10])
-                # print('prev_pos_pred: ',out['prev_pos_pred'][:10])
-                # print('motion_res: ',out['motion_res'][:10])
-                # print('prev_pos_pred_from_res: ', out['prev_pos_pred_from_res'][:10])
+                # store logs in memory
+                losses_str = ', '.join([f"{k}: {v:.4f}" for k, v in loss.items()])
+                batch_log.append(f"SubBatch {sub_batch_idx}: {losses_str} | Total: {total_loss.item():.4f}\n")
+                batch_losses.append((total_loss.item(), loss))
+
                 
-                # Open the log file in append mode
-                with open(log_file, "a") as f:
-                    # Print and log individual losses
-                    print('losses: ', out['losses'])
-                    losses_str = ', '.join([f"{k}: {v:.4f}" for k, v in out['losses'].items()])
-                    print(colored(f"Losses: {losses_str}", 'blue'))
-                    f.write(f"Losses: {losses_str}\n")
 
-                    # Calculate and log total loss
-                    loss = sum(out['losses'].values())
-                    print(colored(f"Total Loss: {loss.item():.4f}", 'red'))
-                    f.write(f"Total Loss: {loss.item():.4f}\n\n")
-
-                # Append to CSV
-                with open(csv_file, "a", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow([epoch, batch_idx, loss.item()] + [v.item() for v in out["losses"].values()])
-
-
-                # Backward pass
-                #ignore this. It works 
-                loss.backward()
-
-                # print(colored(f"Total Loss: {loss.item():.4f}", 'red'))
 
                 print_gpu_memory()
 
@@ -219,27 +218,46 @@ def train_mvsnet(hair_folder:str,
                 # periodic checkpointing
                 if backup_step % save_interval == 0:
                     ckpt_path = os.path.join(checkpoint_dir, f"model_step_{backup_step}.pt")
-                    torch.save({
-                        'step': backup_step,
-                        'model_state': model.state_dict(),
-                        'optimizer_state': optimizer.state_dict(),
-                        'loss': loss.item()
-                    }, ckpt_path)
+                    checkpoint = {
+                        "epoch": epoch,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                    }
+                    torch.save(checkpoint, ckpt_path)
                     print(f"Saved checkpoint at step {backup_step}: {ckpt_path}")
 
                 if sub_batch_idx == sub_batch_epochs:
                     break
 
-                params_set = {id(p) for g in optimizer.param_groups for p in g['params']}
-                for name, p in model.named_parameters():
-                    print(name, p.requires_grad, id(p) in params_set)
+          
 
                 start_time = time.time()
 
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True) #TODO: Maybe bad if error
+            mean_total_loss = sum(x[0] for x in batch_losses) / len(batch_losses)
+            print(colored(f"[Batch {batch_idx}] Avg Total Loss: {mean_total_loss:.4f}", "red"))
 
-        # --- checkpoint saving ---
+            with open(log_file, "a") as f:
+                f.write(f"\n=== Batch {batch_idx} Summary ===\n")
+                f.writelines(batch_log)
+                f.write(f"Average Total Loss: {mean_total_loss:.4f}\n\n")
+
+            with open(csv_file, "a", newline="") as f:
+                writer = csv.writer(f)
+                # log only average per batch, not every sub-batch
+                avg_sub_losses = {
+                    k: sum(x[1][k].item() for x in batch_losses) / len(batch_losses)
+                    for k in batch_losses[0][1].keys()
+                }
+                writer.writerow([epoch, batch_idx, mean_total_loss] + list(avg_sub_losses.values()))
+
+
+            try:
+                scaler.step(optimizer)   
+                scaler.update()          
+            except RuntimeError as e:
+                print("Optimizer step failed:", e)
+                optimizer.zero_grad(set_to_none=True) #TODO: Maybe bad if error
+
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
@@ -249,54 +267,52 @@ def train_mvsnet(hair_folder:str,
         torch.save(checkpoint, checkpoint_file)
         print(colored(f"Checkpoint saved at epoch {epoch}", "green"))
 
-        # # validation phase
-        # model.eval()
-        # val_losses = []
-        # with torch.no_grad():
-        #     for val_batch_idx, val_batch in enumerate(val_loader):
-        #         imgs_raw = val_batch['flow_map'].squeeze(0).squeeze(0).to(device)
-        #         prev_imgs_raw = val_batch['prev_flow_map'].squeeze(0).squeeze(0).to(device)
+        if not small:
+                
+            # validation phase
+            model.eval()
+            val_losses = []
+            with torch.no_grad():
+                for val_batch_idx, val_batch in enumerate(val_loader):
+                    imgs_raw = val_batch['flow_map'].squeeze(0).squeeze(0).to(device)
+                    prev_imgs_raw = val_batch['prev_flow_map'].squeeze(0).squeeze(0).to(device)
 
-        #         # same preprocessing as in train
-        #         scale = 0.25
-        #         new_h, new_w = int(imgs_raw.shape[-2] * scale), int(imgs_raw.shape[-1] * scale)
-        #         imgs = F.interpolate(imgs_raw, size=(new_h, new_w), mode='bilinear', align_corners=False)
-        #         prev_imgs = F.interpolate(prev_imgs_raw, size=(new_h, new_w), mode='bilinear', align_corners=False)
+                    # same preprocessing as in train
+                    scale = 0.25
+                    new_h, new_w = int(imgs_raw.shape[-2] * scale), int(imgs_raw.shape[-1] * scale)
+                    imgs = F.interpolate(imgs_raw, size=(new_h, new_w), mode='bilinear', align_corners=False)
+                    prev_imgs = F.interpolate(prev_imgs_raw, size=(new_h, new_w), mode='bilinear', align_corners=False)
 
-        #         for sub_batch in canonicalize_and_subsample_iter(val_batch, device, num_points=100, num_prev_points=100000):
-        #             data = {
-        #                 'imgs': imgs.float(),
-        #                 'sample_coord': sub_batch['sample_coord'].float(),
-        #                 'pts_world': sub_batch['pts_world'].float(),
-        #                 'pts_view': sub_batch['pts_view'].float() if sub_batch['pts_view'] is not None else None,
-        #                 'flow_view': sub_batch['real_flow_view'].float(),
-        #                 'real_flow_view': sub_batch['real_flow_view'].float(),
-        #                 'prev_imgs': prev_imgs.float(),
-        #                 'prev_sample_coord': sub_batch['prev_sample_coord'].float(),
-        #                 'prev_pts_world': sub_batch['prev_pts_world'].float(),
-        #                 'prev_pts_view': sub_batch['prev_pts_view'].float() if sub_batch['prev_pts_view'] is not None else None,
-        #                 'gt_prev_pos': sub_batch['gt_prev_pos'].float(),
-        #             }
+                    for sub_batch in canonicalize_and_subsample_iter(val_batch, device, num_points=100, num_prev_points=100000):
+                        data = {
+                            'imgs': imgs.float(),
+                            'sample_coord': sub_batch['sample_coord'].float(),
+                            'pts_world': sub_batch['pts_world'].float(),
+                            'pts_view': sub_batch['pts_view'].float() if sub_batch['pts_view'] is not None else None,
+                            'flow_view': sub_batch['real_flow_view'].float(),
+                            'real_flow_view': sub_batch['real_flow_view'].float(),
+                            'prev_imgs': prev_imgs.float(),
+                            'prev_sample_coord': sub_batch['prev_sample_coord'].float(),
+                            'prev_pts_world': sub_batch['prev_pts_world'].float(),
+                            'prev_pts_view': sub_batch['prev_pts_view'].float() if sub_batch['prev_pts_view'] is not None else None,
+                            'gt_prev_pos': sub_batch['gt_prev_pos'].float(),
+                        }
 
-        #             out = model(data)
-        #             loss_val = sum(out['losses'].values())
-        #             val_losses.append(loss_val.item())
+                        out = model(data)
+                        loss_val = sum(out['losses'].values())
+                        val_losses.append(loss_val.item())
 
-        #         # optional: break early for faster validation
-        #         if val_batch_idx >= 20:
-        #             break
 
-        # # average validation loss
-        # val_loss_mean = sum(val_losses) / len(val_losses)
-        # print(colored(f"Validation Loss (epoch {epoch}): {val_loss_mean:.4f}", "yellow"))
+            # validation loss
+            val_loss_mean = sum(val_losses) / len(val_losses)
+            print(colored(f"Validation Loss (epoch {epoch}): {val_loss_mean:.4f}", "yellow"))
 
-        # # log to file
-        # with open(log_file, "a") as f:
-        #     f.write(f"Validation Loss (epoch {epoch}): {val_loss_mean:.4f}\n")
+            # log to file
+            with open(log_file, "a") as f:
+                f.write(f"Validation Loss (epoch {epoch}): {val_loss_mean:.4f}\n")
 
-        # with open(csv_file, "a", newline="") as f:
-        #     writer = csv.writer(f)
-        #     writer.writerow([epoch, "val", val_loss_mean])
+            with open(csv_file, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([epoch, "val", val_loss_mean])
 
-    print("====$$$$$$$$ Training completed $$$$$$$$$$$$$$====")
-
+    print("==== Training completed ====")

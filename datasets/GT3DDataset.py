@@ -163,13 +163,17 @@ class GT3DDataset(BaseDataset):
         item['sample_coord'] = sample_coord
         item['pts_world'] = pts_world
         item['flow_view'] = prev_flows.unsqueeze(1).repeat(1, self.num_views, 1) # gt_prev_pos.unsqueeze(1).repeat(1, self.img_size[1], 1)  # optional, if you want view-wise copies 'TODO: Check img_size is correct
-        item['real_flow_view'] = gt_prev_pos.unsqueeze(1).repeat(1, self.num_views, 1)
+        # item['real_flow_view'] = gt_prev_pos.unsqueeze(1).repeat(1, self.num_views, 1)
         item['prev_pts_world'] = prev_pts_world
         item['prev_sample_coord'] = prev_sample_coord
         item['gt_prev_pos'] = gt_prev_pos     # [N,3]
         item['prev_flow_full_map'] = prev_flow_full_union
         item['prev_flow_map'] = prev_flow_union
         # item['gt_conn_idx'] = gt_conn_idx     # [N]
+
+        real_flow_dir = pts_world - flows  # [N, 3]
+
+        item['real_flow_view'] = real_flow_dir.unsqueeze(1).repeat(1, self.num_views, 1)
 
         return item
 

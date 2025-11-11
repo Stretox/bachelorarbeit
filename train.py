@@ -26,7 +26,9 @@ if __name__ == "__main__":
     parser.add_argument('-b', '--backbone', action='store_true', help="Run Backbone Training")
     parser.add_argument('-o', '--occ', action='store_true', help="Run OccViT Training")
     parser.add_argument('-s', '--san', action='store_true', help="Sanity Checking code")
-    parser.add_argument('-m', '--multi', action='store_true', help="Activate Multi Processing") # Does not work
+    parser.add_argument('-m', '--multi', action='store_true', help="Activate Multi Processing")
+    parser.add_argument('-d', '--directory', default="", help="Checkpoint to be loaded")
+    parser.add_argument('-mini', '--small', action='store_true', help="Skip ")
     args = parser.parse_args()
 
 
