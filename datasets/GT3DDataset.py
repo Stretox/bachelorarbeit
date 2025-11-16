@@ -3,8 +3,8 @@ import torch
 import numpy as np
 from datasets.BaseDataset import BaseDataset
 
-# Do not need utils
 def getProjPoints(points, view, projection, tsfm=None):
+    # This function is (partly) by Monohair https://github.com/KeyuWu-CS/MonoHair?tab=License-1-ov-file
     '''
     project 3D points on camera plane, return projected 2D locations (range [-1, 1])
     each view's contribution for each point, weighted by distance
@@ -141,12 +141,6 @@ class GT3DDataset(BaseDataset):
         prev_pts_world = prev_points.T[:, :3].float()
         gt_prev_pos = flows.float()         # [N,3]
 
-        # from pytorch3d.ops import knn_points
-        # # gt_prev_pos: [N, 3], prev_pts_world: [N_prev, 3]
-        # # knn_points returns distances and indices for each point in gt_prev_pos to its k nearest neighbors in prev_pts_world
-        # knn = knn_points(gt_prev_pos.unsqueeze(0), prev_pts_world.unsqueeze(0), K=1)
-        # gt_conn_idx = knn.idx.squeeze(0).squeeze(-1)  # [N]
-
         pts_view = world_to_view(points.T.to(self.device), self.cam_poses_w2c)         # [N, V, 3]
         prev_pts_view = world_to_view(prev_points.T.to(self.device), self.cam_poses_w2c)  # [N_prev, V, 3]
 
@@ -162,53 +156,15 @@ class GT3DDataset(BaseDataset):
         item['prev_pts_view'] = prev_pts_view
         item['sample_coord'] = sample_coord
         item['pts_world'] = pts_world
-        item['flow_view'] = prev_flows.unsqueeze(1).repeat(1, self.num_views, 1) # gt_prev_pos.unsqueeze(1).repeat(1, self.img_size[1], 1)  # optional, if you want view-wise copies 'TODO: Check img_size is correct
-        # item['real_flow_view'] = gt_prev_pos.unsqueeze(1).repeat(1, self.num_views, 1)
+        item['flow_view'] = prev_flows.unsqueeze(1)
         item['prev_pts_world'] = prev_pts_world
         item['prev_sample_coord'] = prev_sample_coord
         item['gt_prev_pos'] = gt_prev_pos     # [N,3]
         item['prev_flow_full_map'] = prev_flow_full_union
         item['prev_flow_map'] = prev_flow_union
-        # item['gt_conn_idx'] = gt_conn_idx     # [N]
 
         real_flow_dir = pts_world - flows  # [N, 3]
 
         item['real_flow_view'] = real_flow_dir.unsqueeze(1).repeat(1, self.num_views, 1)
 
         return item
-
-
-        # # Global Points
-        # item['points'] = torch.tensor(points).to(self.device) # Randomly mixed points
-        # item['prev_points'] = torch.tensor(prev_points).to(self.device) # Randomly mixed points
-
-        # xy_coords = getProjPoints(item['points'], self.cam_poses_c2w, self.ndc_proj)
-
-        # # [V, N, 1, 2]
-        # item['xy_coords'] = xy_coords
-
-        # item['sample_coords_view'] = xy_coords
-        # if not self.num_pt_required == -1:
-        #     item['sample_coords'] = item['sample_coords'][:self.num_pt_required]
-        # # [N, 3]
-        # # Directions
-        # item['gt_dir_targets'] = dirs[rand_perm].long()
-        # if not self.num_pt_required == -1:
-        #     item['gt_dir_targets'] = item['gt_dir_targets'][:self.num_pt_required]
-
-        # # [N,3]
-        # item['gt_flow_targets'] = flows[rand_perm].long()
-        # if not self.num_pt_required == -1:
-        #     item['gt_flow_targets'] = item['gt_flow_targets'][:self.num_pt_required]
-
-        # # [4, N]
-        # # item['pts_world'] = item['model_tsfm'] @ item['points']
-        # # [V, 4, N]
-        # item['pts_view'] = self.cam_poses_c2w @ item['points']
-
-        # # [N, 1, 3]
-        # item['pts_world'] = item['points'][:3].transpose(0, 1).unsqueeze(1)
-        # # [N, V, 3]
-        # item['pts_view'] = item['pts_view'][:, :3, :].permute(2, 0, 1)
-
-        # return item

@@ -4,6 +4,10 @@ import re
 from typing import NamedTuple
 
 class Camera(NamedTuple):
+    '''
+    simple class holding the camera information from the json files for ever camera
+    '''
+
     name:str
     extrinsic:np.ndarray
     fx:float
@@ -33,11 +37,13 @@ def get_json_cameras(json_file_path: str):
         cam_center = np.array(camera['extrinsics']['view_matrix']).reshape(4,4)[:3, 3] # [x,y,z]
         camera_centers.append(cam_center)
 
+    # Calc the current center for later shifting
     scene_center = np.mean(np.stack(camera_centers), axis=0)
     # print(f"Camera centers before: {scene_center}")
 
     new_camera_centers=[]
 
+    # Get the data from the json file
     for camera in data['cameras']:
         name = camera['camera_id']
         uid = int(re.findall('\d+', name)[0])
@@ -49,10 +55,12 @@ def get_json_cameras(json_file_path: str):
         height = int(camera['intrinsics']['resolution'][1])
         width = int(camera['intrinsics']['resolution'][0])
 
+        # Shift the cameras so the focus the center
         extr[:3,3] = extr[:3,3] - scene_center
         new_center = np.linalg.inv(extr)[:3, 3]
         new_camera_centers.append(new_center)
 
+        # build the camera object 
         camera = Camera(name=name, u_id=uid, fx = fx, fy = fy, cx = cx, cy = cy, width = width, height = height, extrinsic = extr)
 
         cams.append(camera)

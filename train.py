@@ -1,6 +1,6 @@
 import argparse
 import os
-from training.mvsnet import train_mvsnet
+from training.training_loop import train_hairflownet
 
 
 def main(args):
@@ -8,7 +8,7 @@ def main(args):
     print(f'Args:{args} \n')
 
     if args.occ:
-        train_mvsnet(args.hair_folder, args.camera_folder, args.checkpoint ,args.multi)
+        train_hairflownet(args.hair_folder, args.camera_folder, args.checkpoint ,args.multi)
 
 
     print('Training Finished!!!')

@@ -3,9 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from networks.UnetSimple import UNetSimple
 
-# Here is a whale to help you get through this mess of a code:
-# 🐳
-#whalesmakeeverythingbetter
+# 🐳 <- Cute (And the best emoji in unicode)
+
+from einops import rearrange
+
 
 # Positional encoding from nerf-pytorch
 # Embedder and get_embedder by MonoHair: https://github.com/KeyuWu-CS/MonoHair?tab=License-1-ov-file
@@ -61,13 +62,12 @@ def get_embedder(multires, i=0, input_dims=3):
 
 ################################################################################################################################################
 
-from einops import rearrange
-
 class DirectionalCrossAttention(nn.Module):
     """
     Returns:
       out: [N, C] attended outputs
       attn_weights: [N, M] attention probabilities (rows sum to 1)
+      
     """
     def __init__(self, dim, heads=8, dim_head=64, dir_lambda=1.0):
 
@@ -80,170 +80,156 @@ class DirectionalCrossAttention(nn.Module):
         # linear layer: every input connected to every output
         self.to_q = nn.Linear(dim, inner, bias=False) # linear Layer for Query
         self.to_kv = nn.Linear(dim, inner * 2, bias=False) # linear layer for key/value (notice that inner is now 2*inner)
-        self.to_out = nn.Linear(inner, dim) # linear layer for output
+        self.Wo = nn.Linear(inner, dim) # linear layer for output
         self.dir_lambda = dir_lambda
 
-    # ((self), cur_tokens, prev_tokens, pts_world, prev_pts_world, flow_dir)
-    # Where flow direction is the movement of the previous points
-    def forward(self, x_q, x_kv, pos_q, pos_kv, flow_dir=None):
+    # Input: ((self), cur_tokens, prev_tokens, pts_world, prev_pts_world, prev_flow_dir)
+    # Where flow direction is the movement of the previous points!!!
+    def forward(self, x_q, x_kv, pos_q, pos_kv, prev_flow_dir):
         """
+        Computes the Cross Attention forward when calling the class
+        
         Inputs:
 
-        - x_q: Query embeddings (current points)
-        - x_kv: Key/value embeddings (previous points)
-        - pos_q: World coordinates of current points
-        - pos_kv: World coordinates of previous points
-        - flow_dir: Unit flow direction vectors (optional)
+        x_q: Query embeddings (current points)
+        x_kv: Key/value embeddings (previous points)
+        pos_q: World coordinates of current points
+        pos_kv: World coordinates of previous points
+        prev_flow_dir: flow direction vectors for prev_points
         """
 
-        # x_q: [N, C]; x_kv: [M, C]
-        # Handle both [N, C] and [N, V, C] inputs
-        is_3d = x_q.dim() == 3
-        if is_3d:
-            # Flatten views into batch: [N*V, C]
-            N, V, C = x_q.shape
-            M, _, _ = x_kv.shape
-            x_q = x_q.reshape(N*V, C)
-            x_kv = x_kv.reshape(M*V, C)
-            # Repeat pos and flow_dir for each view
-            pos_q = pos_q.unsqueeze(1).expand(-1, V, -1).reshape(N*V, 3)
-            pos_kv = pos_kv.unsqueeze(1).expand(-1, V, -1).reshape(M*V, 3)
-            if flow_dir is not None:
-                flow_dir = flow_dir.unsqueeze(1).expand(-1, V, -1).reshape(N*V, 3)
-        else:
-            N, C = x_q.shape
-            M, _ = x_kv.shape
+        # q, k and v are projected to the inner dimension using the Linear Layers
 
-        # q, k, v are projected to the inner dimension.
         q = self.to_q(x_q) # [N, inner]
-        k, v = self.to_kv(x_kv).chunk(2, dim=-1)  # [M, inner] each
+        k, v = self.to_kv(x_kv).chunk(2, dim=-1)  # [M, inner] for both
 
-        # reshape for multihead: [h, N, d] / [h, M, d]
-        d = q.shape[-1] // self.heads # don't forget to use #attentionisallyouneed
+        # get the d
+        d = q.shape[-1] // self.heads
         assert q.shape[-1] == self.heads * d, "Feature dimension must be divisible by number of heads"
-        # Reshapes tensors to [heads, N, dim_head] for parallel processing.
         
+        # Reshaping tensors to [heads, N, dim_head] for parallel head attention
         q = rearrange(q, 'n (h d) -> h n d', h=self.heads) # q now [h,n,d]
         k = rearrange(k, 'm (h d) -> h m d', h=self.heads) # k now [h,m,d]
         v = rearrange(v, 'm (h d) -> h m d', h=self.heads) # v now [h,m,d]
 
-        # content logits: [h, N, M]
-        # Computes dot-product attention scores, scaled.
-        logits = torch.einsum('h n d, h m d -> h n m', q, k) * self.scale
-        # logits = logits.clamp(min=-50, max=50) #TODO: CLAMP FOR DEBUG
+        L = torch.einsum('h n d, h m d -> h n m', q, k) * self.scale # [h, N, M]
+        # L = L.clamp(min=-50, max=50) #DEBUG CLAMPING
 
-        # if a flow_dir is provided compute a directional alignment bias
-        if flow_dir is not None:
-            # compute direction vectors from query to each prev point: [N, M, 3]
-            # pos_q: [N,3], pos_kv: [M,3]
-            # delta[n,m,3] = pos_kv[m] - pos_q[n]
-            # normalize delta to unit vectors (handle zero distances)
-            delta = pos_kv.unsqueeze(0) - pos_q.unsqueeze(1)            # [1, M, 3] - [N,1,3] = [N, M, 3]
-            # now delta: [N, M, 3]
-            delta_norm = torch.norm(delta, dim=-1, keepdim=True).clamp(min=1e-6)  # [N, M, 1]
-            delta_unit = delta / delta_norm
+        # compute direction vectors from query to each prev_point and use as alignment bias
+        delta = pos_kv.unsqueeze(0) - pos_q.unsqueeze(1) # [N, M, 3]
 
-            # normalize flow_dir [N,3]
-            flow_unit = F.normalize(flow_dir, dim=-1)  # [N,3]
+        delta_norm = torch.norm(delta, dim=-1, keepdim=True).clamp(min=1e-6)  # [N, M, 1]
+        delta_unit = delta / delta_norm
 
-            # cos alignment: [N, M] = flow_unit[n] dot delta_unit[n,m]
-            # compute per-query alignment
-            dir_align = torch.einsum('nd,nmd->nm', flow_unit, delta_unit)  # values in [-1,1]
+        # normalize flow_dir
+        prev_flow_unit = F.normalize(prev_flow_dir, dim=-1)  # [N,3]
 
-            # broadcast to heads and scale by lambda
-            # logits' shape is [h, N, M], so unsqueeze(0) into heads
-            # TODO: Possibly Explosive
-            logits = logits + (self.dir_lambda * dir_align).unsqueeze(0)
+        # compute per-query-point alignment using cosinus formula
+        align = torch.einsum('nd,nmd->nm', prev_flow_unit, delta_unit)  # values are in [-1,1] depending on the alignment
 
-        # softmax over previous points (last dim)
-        attn = torch.softmax(logits, dim=-1)  # [h, N, M]
-        # aggregate values: [h, N, d] = attn @ v
-        out = torch.einsum('h n m, h m d -> h n d', attn, v)
-        # merge heads: [N, inner]
-        out = rearrange(out, 'h n d -> n (h d)')
-        out = self.to_out(out)  # [N, C]
-        # combine attention across heads (average) to produce [N, M] connection probabilities
-        attn_weights = attn.mean(dim=0)  # [N, M]
-        return out, attn_weights
+        # TODO: Possibly Overfiting keep lambda small
+        # Applying the directional bias
+        L = L + (self.dir_lambda * align).unsqueeze(0) # (unsqueeze to apply to all attention heads)
 
-# This class uses the Class DirectionalCrossAttention to predict point correspondences and motion between two sets of 3D points
+        # softmax
+        W_h = torch.softmax(L, dim=-1)  # [h, N, M]
+        
+        # Now we finally multiply the values
+        O = torch.einsum('h n m, h m d -> h n d', W_h, v) # W_hV
+        
+        # merge heads
+        O = rearrange(O, 'h n d -> n (h d)') # [N, inner]
+        O = self.Wo(O)  # [N, C]
 
-class MovementAttn(nn.Module):
+        # combine attention across heads
+        W = W_h.mean(dim=0)  # [N, M]
+        return O, W
+
+# using DirectionalCrossAttention we try to predict point correspondences and motion between two sets of 3D points
+class DeepFlowNet(nn.Module):
     
     def __init__(self, in_feat=3, token_dim=128, vit_heads=8, num_views=4, pt_res=5,
-                dir_lambda=2.0, use_pos=True, use_pt=True):
+                dir_lambda=2.0, debug=False, training=True):
         
+        # Debug ein und ausschalten
+        self.debug = debug
+
+        # Training or Not
+        self.training = training
 
         super().__init__()
-        # backbone (same design as your Ori/Occ models)
+        # backbone for deep feature maps
         self.backbone = UNetSimple(in_channels=in_feat, ksize=5)
         
-        self.base_img_ch = in_feat   # store base image channels
-
-        # Sets up positional embedding (pt_embed)
+        # positional point embedding
         self.pt_embed, self.pt_dim = get_embedder(pt_res, input_dims=3)
 
-        # a small linear to convert view-fused -> token_dim
-        self.view_fuse = nn.Linear(self.backbone.output_feat + self.pt_dim if use_pt else self.backbone.output_feat, token_dim)
+        # used for
+        self.view_fuse = nn.Linear(self.backbone.output_feat + self.pt_dim, token_dim)
 
-        # Cross-attention blockk
+        # Cross-attention block with motion bias
         self.cross_attn = DirectionalCrossAttention(dim=token_dim, heads=vit_heads, dim_head=token_dim // vit_heads, dir_lambda=dir_lambda)
 
-        # optionally a small decoder to predict motion residuals (if you also want regression)
-        self.motion_head = nn.Sequential(
+        # small MLP to predict motion residuals aka a simple decoder
+        # predicts: prev_pos_pred - current_pos
+        self.MLP = nn.Sequential(
             nn.LayerNorm(token_dim),
             nn.Linear(token_dim, token_dim),
             nn.ReLU(),
-            nn.Linear(token_dim, 3)   # predicts residual: prev_pos_pred - current_pos
+            nn.Linear(token_dim, 3) 
         )
 
-        self.use_pt = use_pt
         self.num_views = num_views
-        self.use_pos = use_pos
 
-        # losses that might be used externally
+        # losses
         self.ce_loss = nn.CrossEntropyLoss()
         self.l1_loss = nn.L1Loss()
 
     def sample_feats_from_backbone(self, imgs, sample_coord):
         """
-        puts 
-        Helper: returns [N, V, C_f]
+        wrapper function
+        
+        returns features with per view point embeddings and permutes them to [N, V, C_f]
         """
-        # backbone returns [V, C_f, N] and permute to [N, V, C_f]
-        feat = self.backbone(imgs, sample_coord).permute(2, 0, 1)
+
+        # backbone returns with shape [V, C_f, N]
+        feat = self.backbone(imgs, sample_coord).permute(2, 0, 1) # permute to [N, V, C_f]
         return feat
 
-    def fuse_per_point_token(self, img_feat, pts_view_feat=None, pts_world_feat=None):
+    def fuse_per_point_token(self, img_feat, pts_view_feat):
         """
-        img_feat: [N, V, C_f]
-        pts_view_feat: [N, V, C_pt] or None
-        returns: per-point token embeddings [N, token_dim]
+        Input 
+        img_feat: The Image features from the backbone | shape: [N, V, C_f]
+        pts_view_feat The per point embeddings for each point | shape: [N, V, C_pt]
+        
+        returns: per-point token embeddings | shape: [N, token_dim]
         """
-        if self.use_pt and pts_view_feat is not None:
+        if self.use_pt_encodings:
             inp = torch.cat([img_feat, pts_view_feat], dim=-1)  # [N, V, C_f + C_pt]
         else:
             inp = img_feat  # [N, V, C_f]
-        # pts_world_feat
+
         # map each view to token_dim
         view_tokens = self.view_fuse(inp)  # [N, V, token_dim]
-        # aggregate across views -> we use mean as a simple per-point embedding
-        point_tokens = view_tokens.mean(dim=1)  # [N, token_dim] # UNUSED
-        return point_tokens, view_tokens
+
+        # use mean to fuse over views
+        point_tokens = view_tokens.mean(dim=1)  # [N, token_dim]
+        return point_tokens
 
     def forward(self, data):
         """
         Main Model forward. Returns a dict with:
-          - 'alpha': [N, N_prev] attention weights
-          - 'prev_pos_pred': [N, 3] weighted prev position
-          - 'motion_res': [N, 3] predicted residual (optional)
-          - the losses
-        All just useful for interpreting
+
+        'W': attention weights | shape [N, N_prev]
+        'prev_pos_pred': weighted prev position | shape [N, 3]
+        'motion_res': predicted residual | shape [N, 3]
+        
+        !!! and the losses for backward !!!
+
         """
 
-        # data (dict) :
+        # data (dict(input)) :
         # ['imgs']
-        # ['masks']
         # ['pts_world']
         # ['pts_view']
         # ['prev_feats']
@@ -253,20 +239,16 @@ class MovementAttn(nn.Module):
 
         ############################## get current per-point features ########################################
         imgs = data['imgs']                # [V, C, H, W]
-        # masks = data.get('masks', None) # Masks would be better but eh
+        # masks = data.get('masks', None) # backbone doesn't use masks atm
         sample_coord = data['sample_coord']  # [V, N, 1, 2]
         pts_world = data['pts_world']        # [N, 3]
-        pts_view = data.get('pts_view', None) # [N, V, 3] (optional)
+        pts_view = data.get('pts_view', None) # [N, V, 3]
 
 
         # flow per view: your flow direction per view projected to the 3D query
         #TODO: NOT Optional Optional Optional Optional Optional Optional Optional Optional Optional
-        flow_view = data.get('flow_view', None)  # [N, V, 3] (per-view direction estimate)
-        if flow_view is not None:
-            # average and normalize flow directions across views that have valid masks
-            flow_dir = F.normalize(flow_view.mean(dim=1), dim=-1)  # [N, 3]
-        else:
-            flow_dir = None
+        prev_flow = data.get('flow_view', None)  # [N, 3] 
+        prev_flow_dir = F.normalize(prev_flow.mean(dim=1), dim=-1)  # [N, 3]
 
         # GT flow direction
         real_flow_view = data.get('real_flow_view', None)
@@ -277,111 +259,112 @@ class MovementAttn(nn.Module):
 
         # print(f"2 {real_flow_dir.shape}")
 
+        #################### per point features ########################################################
+
         # extract current points features (deep feature maps)
         img_feat = self.sample_feats_from_backbone(imgs, sample_coord) # (N, V, C_f)
 
         # Embed world coordinates
-        pts_world_feat = self.pt_embed(pts_world) if self.use_pt else None
+        pts_world_feat = self.pt_embed(pts_world)
     
         # flatten per-view pts_view into per-view embeddings
-        # pts_view shape [N, V, 3] | reshape to [N*V,3], embed, then reshape back
+        # pts_view points in camera view | shape [N, V, 3]
+        # reshape to [N*V,3], embed, then reshape back
+
         N = pts_view.shape[0]; V = pts_view.shape[1]
         pv_flat = pts_view.reshape(-1, 3)
         pv_emb = self.pt_embed(pv_flat).reshape(N, V, -1)
         pts_view_feat = pv_emb
 
-        # Aggregates features across views into per-point tokens.
-        cur_tokens, _ = self.fuse_per_point_token(img_feat, pts_view_feat=pts_view_feat, pts_world_feat=pts_world_feat)  # [N, token_dim]
+        # per-point token generation
+        cur_tokens = self.fuse_per_point_token(img_feat, pts_view_feat=pts_view_feat)  # Returned: [N, token_dim]
 
         ##################### get previous per-point features ############################################
 
-        # if prev_feats in data and data['prev_feats'] is not None:
-        #     prev_img_feat = data['prev_feats']  # expected [N_prev, V, C_f]
-        # elif 'prev_sample_coord' in data and 'prev_imgs' in data:
-        if 'prev_sample_coord' in data and 'prev_imgs' in data:
-            prev_img_feat = self.sample_feats_from_backbone(data['prev_imgs'], data['prev_sample_coord'])
-        else:
-            raise ValueError('Please provide prev_feats or prev_sample_coord+prev_imgs')
+        # per view features
+        prev_img_feat = self.sample_feats_from_backbone(data['prev_imgs'], data['prev_sample_coord'])
 
         prev_pts_world = data['prev_pts_world']  # [N_prev, 3]
-        prev_pts_view = data.get('prev_pts_view', None)
-        prev_pts_world_feat = self.pt_embed(prev_pts_world) if self.use_pt else None
+        prev_pts_view = data['prev_pts_view'] # 
+
+        # Embed world coordinates
+        prev_pts_world_feat = self.pt_embed(prev_pts_world)
         
-        Np = prev_pts_view.shape[0]; V = prev_pts_view.shape[1]
+        N = prev_pts_view.shape[0]
+        V = prev_pts_view.shape[1]
         ppv_flat = prev_pts_view.reshape(-1, 3)
-        ppv_emb = self.pt_embed(ppv_flat).reshape(Np, V, -1)
+        ppv_emb = self.pt_embed(ppv_flat).reshape(N, V, -1)
         prev_pts_view_feat = ppv_emb
 
-        prev_tokens, _ = self.fuse_per_point_token(prev_img_feat, pts_view_feat=prev_pts_view_feat, pts_world_feat=prev_pts_world_feat)  # [N_prev, token_dim]
+        prev_tokens, _ = self.fuse_per_point_token(prev_img_feat, pts_view_feat=prev_pts_view_feat)  # [N_prev, token_dim]
 
         ####################### cross-attention: current tokens attend to prev tokens ############################################
+        
         # DirectionalCrossAttention input:
-        # pos_q = pts_world [N,3], pos_kv = prev_pts_world [N_prev,3], flow_dir aggregated [N,3]
-        attn_out, alpha = self.cross_attn(cur_tokens, prev_tokens, pts_world, prev_pts_world, flow_dir)
+        # embeddings + pts_world.shape = [N,3], prev_pts_world.shape = [N_prev,3], prev_flow_dir.shape = [N,3]
+        O, W = self.cross_attn(cur_tokens, prev_tokens, pts_world, prev_pts_world, prev_flow_dir)
 
         # predicted previous position: weighted sum of previous points
-        prev_pos_pred = torch.matmul(alpha, prev_pts_world)  # [N, 3] (same size as pts_world)
+        prev_pos_pred = torch.matmul(W, prev_pts_world)  # [N, 3] (same size as pts_world)
 
-        # Predicted motion #    residual
-        motion_res = self.motion_head(attn_out)  # [N, 3] (Motion Vectors for )
-        # interpret as predicted_prev_pos = current_pos + motion_res
-        prev_pos_pred_from_res = pts_world + motion_res
+        # Predicted motion with MLP
+        motion_dir = self.MLP(O)  # [N, 3] (per point motion directions prediction)
+        
+        # position from motion_dir for loss
+        prev_pos_pred_from_res = pts_world + motion_dir
 
         out = {
-            'alpha': alpha,                       # [N, N_prev] indexes
-            'prev_pos_pred': prev_pos_pred,       # attention-weighted prev pos estimation/prediction. Married to alpha
-            'motion_res': motion_res,             # regressed residual. Direct mapping to a prev point
-            'prev_pos_pred_from_res': prev_pos_pred_from_res # Vector pointing along motion_res
+            'W': W, # [N, N_prev] indexes (attention output)
+            'prev_pos_pred': prev_pos_pred, # attention-weighted prev pos estimation
+            'motion_dir': motion_dir, # Motion per point (kinda normalized)
         }
 
-        ####################### losses if GT provided ################################ (For training obvs)
+        ####################### losses ####################################################### (only for training obvs)
         losses = {}
 
-        print(alpha.requires_grad)
-        print(alpha[0, :10])
+        if self.training:
 
-        # Soft supervision for attention weights using 3D distance
-        if 'pts_world' in data and 'gt_prev_pos' in data and 'prev_pts_world' in data:
-            query_pos_gt = data['pts_world']       # [N, 3]
-            gt_prev_pos  = data['gt_prev_pos']     # [N, 3]
-            prev_pos_gt  = data['prev_pts_world']  # [N_prev, 3]
+            # DEBUG for sanity
+            if self.debug:
+                print(W.requires_grad)
+                print(W[0, :10])
 
-            # compute distances between each gt_prev_pos (1 per query) and all candidate prev points
+            # Soft supervision for attention weights using distance because of subsampling
+            gt_prev_pos  = data['gt_prev_pos'] # [N, 3]
+            prev_pos_keys  = data['prev_pts_world'] # [N_prev, 3]
+
+            # compute distances between each gt_prev_pos and the sampled candidate prev points
             with torch.no_grad():
-                dist = torch.cdist(gt_prev_pos, prev_pos_gt)  # [N, N_prev]
-                print(dist.min(dim=-1).values.mean())
+                dist = torch.cdist(gt_prev_pos, prev_pos_keys)  # [M_gt, M]
 
-                # use adaptive temperature for stable softmax sharpness
-                temp = max(dist.median().item() * 0.3, 1e-3)  # e.g. median*0.5
+                # using adaptive temperature for stable softmax sharpness
+                temp = max(dist.median().item() * 0.3, 1e-3)  # e.g. median*(hyperparameter for the heat)
                 soft_target = F.softmax(-dist / temp, dim=-1)
 
-            print(soft_target[0].max(), soft_target[0].mean())
+            if self.debug:
+                print(soft_target[0].max(), soft_target[0].mean(), soft_target[0].min()) # DEBUG
 
-            # shape check
-            assert soft_target.shape == alpha.shape, f"soft_target={soft_target.shape}, alpha={alpha.shape}"
-
-            # stable log and soft cross-entropy
-            log_alpha = (alpha.clamp(min=1e-6)).log()
-            soft_ce = -(soft_target * log_alpha).sum(dim=-1).mean()
+            # soft cross-entropy loss
+            log_W = (W.clamp(min=1e-6)).log()
+            soft_ce = -(soft_target * log_W).sum(dim=-1).mean()
 
             losses['conn_ce_soft'] = soft_ce
 
 
-        # regression loss between attention-weighted prev pos and GT prev pos ## Insert sunglasses emoji meme ##
-        if 'gt_prev_pos' in data and data['gt_prev_pos'] is not None:
+            # regression losses between attention-weighted prev pos and GT prev pos (Seem to overfit at the moment)
+            # Regulation for the MLP and 
             gt_prev_pos = data['gt_prev_pos']
             l1 = self.l1_loss(prev_pos_pred, gt_prev_pos)
             l1_res = self.l1_loss(prev_pos_pred_from_res, gt_prev_pos)
             losses['conn_l1_attn'] = l1
             losses['conn_l1_res'] = l1_res
-            # Just standard stuff basically
 
-        # flow consistency (encourages predicted prev position to be along real flow dir)
-        vec = F.normalize(motion_res, dim=-1)  # Direction from current to predicted previous position
-        flow_u = F.normalize(real_flow_dir, dim=-1)          # Normalized ground truth flow direction
-        cos = (flow_u * vec).sum(dim=-1)                     # Cosine similarity between `vec` and `flow_u`
-        flow_consistency = torch.mean(1.0 - cos)             # Loss: 1 + cos
-        losses['flow_consistency'] = flow_consistency
+            # flow consistency (predicted prev position shall be be along real flow dir)
+            vec = F.normalize(motion_dir, dim=-1)  # direction from current to predicted previous position
+            flow_u = F.normalize(real_flow_dir, dim=-1) # Normalized
+            cos = (flow_u * vec).sum(dim=-1) # Cosine similarity
+            flow_consistency = torch.mean(1.0 - cos) # Loss: 1 - cos
+            losses['flow_consistency'] = flow_consistency # to output
 
-        out['losses'] = losses
+            out['losses'] = losses
         return out

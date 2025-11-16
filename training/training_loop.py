@@ -1,6 +1,5 @@
 import torch
 import torch.nn.functional as F
-from networks.deepflownet import MovementAttn
 import gc
 import csv
 import os
@@ -8,24 +7,51 @@ import time
 from datetime import datetime
 from torch.utils.data import DataLoader
 import torch.optim as optim
-torch.set_float32_matmul_precision('high')
 from torch import GradScaler
-
 from termcolor import colored
 
+torch.set_float32_matmul_precision('high') # Relevant to not get annoyed by warnings
+
+# Own Imports
+
+from networks.deepflownet import DeepFlowNet
 from datasets.GT3DDataset import GT3DDataset
-from training.backbone import print_gpu_memory
+from utils.subsample_utils import subsample_iter
 
-from utils.subsample_utils import canonicalize_and_subsample, canonicalize_and_subsample_iter
+def print_gpu_memory():
+    
+    if torch.cuda.is_available():
+        # get current GPU from torch
+        device = torch.cuda.current_device()
+        device_name = torch.cuda.get_device_name(device)
 
-def train_mvsnet(hair_folder:str, 
+        # get memory stats
+        total_memory = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+        allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
+        reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
+        free = total_memory - reserved
+
+        # print the stats
+        print(f"GPU: {device_name}")
+        print(f"Total Memory: {total_memory:.2f} GB")
+        print(f"Allocated: {allocated:.2f} GB")
+        print(f"Reserved: {reserved:.2f} GB")
+        print(f"Free: {free:.2f} GB")
+    
+    else:
+        print("CUDA is not available.")
+
+def train_hairflownet(
+                hair_folder:str, 
                 camera_folder:str,
                 checkpoint_save_path:str,  
                 multi:bool=False,
                 load_checkpoint: bool = False,
                 small:bool = True,
-                checkpoint_path: str ="/home/student_korfhage/mvshair/data/checkpoints11/checkpoint_epoch_4.pt",
-                 ):
+                checkpoint_path: str = "",
+                ):
+    
+
     
     log_dir = os.path.join(checkpoint_save_path, "logs")
     os.makedirs(log_dir, exist_ok=True)
@@ -34,19 +60,18 @@ def train_mvsnet(hair_folder:str,
     now = datetime.now()
     timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
 
-    # Define the log file path with timestamp
     log_file = os.path.join(log_dir, f"training_losses_{timestamp}.log")
     csv_file = os.path.join(log_dir, f"training_losses_{timestamp}.csv")
 
-    save_interval = 100  # save every 20 batches
+    save_interval = 100  # save every n batches
     checkpoint_dir = checkpoint_save_path 
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    backup_step = 0
+    backup_step = 0 # counter for 
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu' # device for calculation
 
-    V = 32             # num views
+    V = 32 # num views (cameras)
 
     dataset = GT3DDataset(hair_folder, camera_folder, device=device)
     print(f"Dataset length: {len(dataset)}")
@@ -54,13 +79,14 @@ def train_mvsnet(hair_folder:str,
     torch.cuda.empty_cache()
 
     if small:
+        # take only a small dataset for sanity training
         small_split = 0.9
         num_val = int(len(dataset) * small_split)
         num_train = len(dataset) - num_val
         train_dataset, _ = torch.utils.data.random_split(dataset, [num_train, num_val])
         print(f"Train samples: {len(train_dataset)}")
     else:
-        # Split dataset into train/val
+        # Split dataset into training and validation
         val_split = 0.1
         num_val = int(len(dataset) * val_split)
         num_train = len(dataset) - num_val
@@ -80,7 +106,7 @@ def train_mvsnet(hair_folder:str,
         dataloader = DataLoader(
             train_dataset,
             batch_size=1,
-            shuffle=True, #TODO: should be true
+            shuffle=True,
             num_workers=0,
             pin_memory=False,
             # prefetch_factor=1,
@@ -90,34 +116,49 @@ def train_mvsnet(hair_folder:str,
         dataloader = DataLoader(
             train_dataset,
             batch_size=1,
-            shuffle=True, #TODO: should be true
+            shuffle=True,
             num_workers=1,
             pin_memory=False,
             # collate_fn=DeviceCollate(device)
         )
 
     # model & optimizer stuff
-    model = MovementAttn(in_feat=1, token_dim=64, vit_heads=4, num_views=V, dir_lambda=0.7).to(device)
-    model = torch.compile(model) 
-    optimizer = optim.Adam(list(model.parameters()), lr=1e-2)
+    model = DeepFlowNet(in_feat=1, token_dim=64, vit_heads=4, num_views=V, dir_lambda=0.7).to(device)
+    model = torch.compile(model) # Compile model for faster training
+    optimizer = optim.Adam(list(model.parameters()), lr=1e-3) # type: ignore #TODO: lr anpassen
+
+    ############### Load checkpoint if available #####################################################
 
     start_epoch = 0
-    if load_checkpoint and checkpoint_path is not "" and os.path.exists(checkpoint_path):
+    if load_checkpoint and checkpoint_path is not "" and os.path.exists(checkpoint_path) and checkpoint_path.startswith('checkpoint_epoch'):
+        
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model.load_state_dict(checkpoint["model_state_dict"]) # type: ignore
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = checkpoint["epoch"] + 1
+
         print(colored(f"Resuming training from epoch {start_epoch}", "green"))
+    
+    elif load_checkpoint and checkpoint_path is not "" and os.path.exists(checkpoint_path) and checkpoint_path.startswith('model'):
+
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"]) # type: ignore
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        current_epoch = checkpoint["epoch"]
+        
+        print(colored(f"Resuming training in epoch {current_epoch}", "green"))
 
     # Initialize CSV file with headers
     with open(csv_file, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["Epoch", "Batch", "Loss_Total", "CE" ,"conn_l1_attn", "conn_l1_res", "flow_consistency"])
 
-    num_epochs = 1000
+    num_epochs = 100
     sub_batch_epochs = 100
+    
+    # Training loop
     for epoch in range(start_epoch, num_epochs):
-        model.train()
+        model.train() # type: ignore
 
         print(colored( f"New EPOCH:  {epoch}", "green"))
 
@@ -128,6 +169,7 @@ def train_mvsnet(hair_folder:str,
 
             # print(f'Sanity Check | batch indexes: {batch.get_strand_idx_from_idx[batch_idx]} | prev_batch indexes: {dataset[batch_idx-1].get_strand_idx_from_idx[batch_idx]}') #TODO:
 
+            # Reshape Images to fit on the GPU memory during training
             with torch.no_grad():
                 imgs_raw = batch['flow_map'].squeeze(0).squeeze(0).to(device)
                 print(f'IMGS Shape: {imgs_raw.shape}')
@@ -149,7 +191,8 @@ def train_mvsnet(hair_folder:str,
 
                 print(f'Flow Map Shape: {imgs.shape} (Subsamples IMGS)')
 
-            for i, chunk in enumerate(canonicalize_and_subsample_iter(batch, device, num_points=100, num_prev_points=100000)):
+            # Sanity print
+            for i, chunk in enumerate(subsample_iter(batch, device, num_points=100, num_prev_points=100000)):
                 print("chunk", i, {k: (None if v is None else tuple(v.shape)) for k, v in chunk.items()})
                 if i >= 2:
                     break
@@ -160,22 +203,22 @@ def train_mvsnet(hair_folder:str,
             batch_log = []  # collect logs for this batch
             batch_losses = []
 
-            for sub_batch_idx, sub_batch in enumerate(canonicalize_and_subsample_iter(batch, device, num_points=100, num_prev_points=100000)):
+            for sub_batch_idx, sub_batch in enumerate(subsample_iter(batch, device, num_points=100, num_prev_points=100000)):
 
                 clean = sub_batch
 
                 data = {
                     'imgs': imgs.float().to(device),
-                    'sample_coord': clean['sample_coord'].float(),
-                    'pts_world': clean['pts_world'].float(),
+                    'sample_coord': clean['sample_coord'].float(), # type: ignore
+                    'pts_world': clean['pts_world'].float(), # type: ignore
                     'pts_view': clean['pts_view'].float() if clean['pts_view'] is not None else None,
-                    'flow_view': clean['real_flow_view'].float(),
-                    'real_flow_view': clean['real_flow_view'].float(),
+                    'flow_view': clean['real_flow_view'].float(), # type: ignore
+                    'real_flow_view': clean['real_flow_view'].float(), # type: ignore
                     'prev_imgs': imgs.float(),  # reuse for sanity
-                    'prev_sample_coord': clean['prev_sample_coord'].float(),
-                    'prev_pts_world': clean['prev_pts_world'].float(),
+                    'prev_sample_coord': clean['prev_sample_coord'].float(), # type: ignore
+                    'prev_pts_world': clean['prev_pts_world'].float(), # type: ignore
                     'prev_pts_view': clean['prev_pts_view'].float() if clean['prev_pts_view'] is not None else None,
-                    'gt_prev_pos': clean['gt_prev_pos'].float(),
+                    'gt_prev_pos': clean['gt_prev_pos'].float(), # type: ignore
                 }
 
                 del clean
@@ -188,15 +231,12 @@ def train_mvsnet(hair_folder:str,
 
                      # Backward pass
                     #ignore this. It works 
-                    scaler.scale(total_loss).backward() #TODO: Really tho?
+                    scaler.scale(total_loss).backward()  # type: ignore
 
                 # store logs in memory
                 losses_str = ', '.join([f"{k}: {v:.4f}" for k, v in loss.items()])
-                batch_log.append(f"SubBatch {sub_batch_idx}: {losses_str} | Total: {total_loss.item():.4f}\n")
-                batch_losses.append((total_loss.item(), loss))
-
-                
-
+                batch_log.append(f"SubBatch {sub_batch_idx}: {losses_str} | Total: {total_loss.item():.4f}\n") # type: ignore
+                batch_losses.append((total_loss.item(), loss)) # type: ignore
 
                 print_gpu_memory()
 
@@ -220,7 +260,7 @@ def train_mvsnet(hair_folder:str,
                     ckpt_path = os.path.join(checkpoint_dir, f"model_step_{backup_step}.pt")
                     checkpoint = {
                         "epoch": epoch,
-                        "model_state_dict": model.state_dict(),
+                        "model_state_dict": model.state_dict(), # type: ignore
                         "optimizer_state_dict": optimizer.state_dict(),
                     }
                     torch.save(checkpoint, ckpt_path)
@@ -258,49 +298,57 @@ def train_mvsnet(hair_folder:str,
                 print("Optimizer step failed:", e)
                 optimizer.zero_grad(set_to_none=True) #TODO: Maybe bad if error
 
+
+        ################ Epoch Checkpoint ###############################
+
         checkpoint = {
             "epoch": epoch,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": model.state_dict(), # type: ignore
             "optimizer_state_dict": optimizer.state_dict(),
         }
         checkpoint_file = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}.pt")
         torch.save(checkpoint, checkpoint_file)
-        print(colored(f"Checkpoint saved at epoch {epoch}", "green"))
+        print(colored(f"Checkpoint saved at epoch {epoch}", "green")) # High viz logging
 
-        if not small:
+        # validation phase
+        if not small: #skip for sanity checking
                 
-            # validation phase
-            model.eval()
+            
+            model.eval() # type: ignore # Turn off certain Layers for Evaluation
+
             val_losses = []
+
             with torch.no_grad():
-                for val_batch_idx, val_batch in enumerate(val_loader):
+                for val_batch_idx, val_batch in enumerate(val_loader): # type: ignore
+                    
                     imgs_raw = val_batch['flow_map'].squeeze(0).squeeze(0).to(device)
                     prev_imgs_raw = val_batch['prev_flow_map'].squeeze(0).squeeze(0).to(device)
 
                     # same preprocessing as in train
+                    
                     scale = 0.25
                     new_h, new_w = int(imgs_raw.shape[-2] * scale), int(imgs_raw.shape[-1] * scale)
                     imgs = F.interpolate(imgs_raw, size=(new_h, new_w), mode='bilinear', align_corners=False)
                     prev_imgs = F.interpolate(prev_imgs_raw, size=(new_h, new_w), mode='bilinear', align_corners=False)
 
-                    for sub_batch in canonicalize_and_subsample_iter(val_batch, device, num_points=100, num_prev_points=100000):
+                    for sub_batch in subsample_iter(val_batch, device, num_points=100, num_prev_points=100000):
                         data = {
                             'imgs': imgs.float(),
-                            'sample_coord': sub_batch['sample_coord'].float(),
-                            'pts_world': sub_batch['pts_world'].float(),
-                            'pts_view': sub_batch['pts_view'].float() if sub_batch['pts_view'] is not None else None,
-                            'flow_view': sub_batch['real_flow_view'].float(),
-                            'real_flow_view': sub_batch['real_flow_view'].float(),
+                            'sample_coord': sub_batch['sample_coord'].float(), # type: ignore
+                            'pts_world': sub_batch['pts_world'].float(), # type: ignore
+                            'pts_view': sub_batch['pts_view'].float(), # type: ignore
+                            'flow_view': sub_batch['real_flow_view'].float(), # type: ignore
+                            'real_flow_view': sub_batch['real_flow_view'].float(), # type: ignore
                             'prev_imgs': prev_imgs.float(),
-                            'prev_sample_coord': sub_batch['prev_sample_coord'].float(),
-                            'prev_pts_world': sub_batch['prev_pts_world'].float(),
-                            'prev_pts_view': sub_batch['prev_pts_view'].float() if sub_batch['prev_pts_view'] is not None else None,
-                            'gt_prev_pos': sub_batch['gt_prev_pos'].float(),
+                            'prev_sample_coord': sub_batch['prev_sample_coord'].float(), # type: ignore
+                            'prev_pts_world': sub_batch['prev_pts_world'].float(), # type: ignore
+                            'prev_pts_view': sub_batch['prev_pts_view'].float(), # type: ignore
+                            'gt_prev_pos': sub_batch['gt_prev_pos'].float(), # type: ignore
                         }
 
                         out = model(data)
                         loss_val = sum(out['losses'].values())
-                        val_losses.append(loss_val.item())
+                        val_losses.append(loss_val.item()) # type: ignore
 
 
             # validation loss
@@ -315,4 +363,4 @@ def train_mvsnet(hair_folder:str,
                 writer = csv.writer(f)
                 writer.writerow([epoch, "val", val_loss_mean])
 
-    print("==== Training completed ====")
+    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!  Training completed !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
