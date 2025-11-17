@@ -14,6 +14,12 @@ In the current state the Transformer is unable to reliably predict previous poin
 - [ ] Provide example data for training-testing
 - [ ] Find the issue with the model
 
+# Setup
+
+Install the necessary requirements by running
+
+``` conda create -f hair.yaml ```
+
 # Training
 
 CUDA is required!!!
