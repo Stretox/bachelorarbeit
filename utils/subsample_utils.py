@@ -88,8 +88,10 @@ def subsample(batch, device, num_points=1000, num_prev_points=1000, debug=False)
     prev_sample_coord = prev_sample_coord[:, prev_idx, :, :].contiguous()
 
     # pts_world/prev_pts_world on device and subsampled
-    pts_world = pts_world.to(device)[idx].contiguous()
-    prev_pts_world = prev_pts_world.to(device)[prev_idx].contiguous()
+    if num_points > 0:
+        pts_world = pts_world.to(device)[idx].contiguous()
+    if num_prev_points > 0:
+        prev_pts_world = prev_pts_world.to(device)[prev_idx].contiguous()
 
     # pts_view/prev_pts_view: assume shape [N, V, 3] and [N_prev, V, 3]
     pts_view = pts_view.to(device)[idx].contiguous()
@@ -186,8 +188,10 @@ def subsample_iter(batch, device, num_points:int=1000, num_prev_points:int=1000,
     for i in range(num_chunks):
         start = i * num_points
         end = min((i + 1) * num_points, N)
-        idx = torch.arange(start, end, dtype=torch.long, device=device)
-
+        rand_idx = torch.randperm(N, device=device)
+        # idx = torch.arange(start, end, dtype=torch.long, device=device)
+        idx = rand_idx[start:end]
+        
         sub_pts_world = pts_world_full[idx]  # [num_points, 3]
         dists = torch.cdist(sub_pts_world, prev_pts_world_full, p=2)  # [num_points, M]
         _, knn_idx = torch.topk(dists, k=num_prev_points, dim=1, largest=False)  # [num_points, k]
@@ -201,11 +205,6 @@ def subsample_iter(batch, device, num_points:int=1000, num_prev_points:int=1000,
         # sample current and prev
         sample_coord = sample_coord_full[:, idx, :, :].contiguous()
         pts_world = pts_world_full[idx].contiguous()
-        pts_view = safe_index(pts_view_full, idx)
-        gt_prev_pos = safe_index(gt_prev_pos_full, idx)
-        
-        # pts_world and related are part of current points
-        pts_world = safe_index(pts_world_full, idx)
         pts_view = safe_index(pts_view_full, idx)
         gt_prev_pos = safe_index(gt_prev_pos_full, idx)
         real_flow_view = safe_index(real_flow_view_full, idx)
